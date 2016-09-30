@@ -80,6 +80,10 @@ def main():
     parser.add_argument('--api-url',
                         help='The API URL of GitHub or GitHub Enterprise. Defaults to %s.' % DEFAULT_API_URL)
     parser.add_argument('-v', '--verbosity', action='count', default=0, help='Increase output verbosity.')
+    parser.add_argument('-n', '--dry-run', action='store_true', default=False,
+                        dest='dry_run',
+                        help="Don't actually change anything (delete forks, create PRs, edit files, etc.), "
+                            + "just show what would be done. Note that this will still create forks.")
     parser.add_argument('old', help='Old string to replace.')
     parser.add_argument('new', help='Replacement string.')
     parser.add_argument('commit_message_file', help='File containing the Git commit message.')
@@ -95,6 +99,7 @@ def main():
     base_url = base_url_from_domain(args.domain) if args.domain is not None else DEFAULT_BASE_URL
     ssh_uri = ssh_uri_from_domain(args.domain) if args.domain is not None else DEFAULT_SSH_URI
     api_url = args.api_url if args.api_url is not None else DEFAULT_API_URL
+    dry_run = args.dry_run
 
     try:
         commit_msg_title, commit_msg = parse_commit_message_file(
@@ -107,7 +112,7 @@ def main():
     # Remind committers for open PRs
     if args.at_mention_committers:
         remind_prs(base_url, api_url, pr_branch, args.fork_owner,
-                   args.github_token)
+                   args.github_token, dry_run)
 
     if args.not_only_recently_pushed_repos:
         logger.info('Searching all code...')
@@ -147,13 +152,16 @@ def main():
         forked_repo = '%s/%s' % (args.fork_owner, repo_name)
 
         if args.delete_forks:
-            logger.info('Deleting your fork %s if it exists.', forked_repo)
-            status = delete_repo(api_url, args.fork_owner, repo_name, args.github_token)
-            if status == requests.codes.no_content:
-                logger.info('Successfully deleted your fork "%s/%s".', args.fork_owner, repo_name)
+            if dry_run:
+                logger.info('Would delete your fork %s if it exists.', forked_repo)
             else:
-                logger.info('Couldn\'t delete your fork "%s/%s". Got status code %d.'
-                            % (args.fork_owner, repo_name, status))
+                logger.info('Deleting your fork %s if it exists.', forked_repo)
+                status = delete_repo(api_url, args.fork_owner, repo_name, args.github_token)
+                if status == requests.codes.no_content:
+                    logger.info('Successfully deleted your fork "%s/%s".', args.fork_owner, repo_name)
+                else:
+                    logger.info('Couldn\'t delete your fork "%s/%s". Got status code %d.'
+                                % (args.fork_owner, repo_name, status))
 
         if not fork_repo(api_url, repo_owner, repo_name, args.github_token):
             exit('Couldn\'t fork repository %s to owner %s.' % (repo, args.fork_owner))
@@ -185,23 +193,32 @@ def main():
             f.write(new_text)
 
         # Git commit file and push to Github
-        branch_add_commit_push(file_path, pr_branch, commit_msg, repo_clone_path)
-        logger.info('Pushed new branch %s to repo %s.', pr_branch, forked_repo)
+        branch_add_commit_push(file_path, pr_branch, commit_msg, repo_clone_path, dry_run)
+        if dry_run:
+            logger.info('Would push new branch %s to repo %s.', pr_branch, forked_repo)
+        else:
+            logger.info('Pushed new branch %s to repo %s.', pr_branch, forked_repo)
 
-        pr_number = create_pull_request(
-            api_url, repo_owner, repo_name, args.github_token,
-            pull_request_title(commit_msg_title),
-            '%s:%s' % (args.fork_owner, pr_branch), body=commit_msg)
+        # create pull request
+        pr_title = pull_request_title(commit_msg_title)
+        if dry_run:
+            logger.info('Would create PR at %s/%s with title "%s" and body: %s',
+                        repo_owner, repo_name, pr_title, commit_msg)
+        else:
+            pr_number = create_pull_request(
+                api_url, repo_owner, repo_name, args.github_token,
+                pr_title,
+                '%s:%s' % (args.fork_owner, pr_branch), body=commit_msg)
 
-        if pr_number is None:
-            exit('Couldn\'t create pull request from head repo %s:%s to base repo %s.'
-                 % (forked_repo, pr_branch, repo))
+            if pr_number is None:
+                exit('Couldn\'t create pull request from head repo %s:%s to base repo %s.'
+                    % (forked_repo, pr_branch, repo))
 
-        pr_url = '%s%s/pull/%d' % (base_url, repo, pr_number)
-        logger.info('Created pull request. See %s.', pr_url)
+            pr_url = '%s%s/pull/%d' % (base_url, repo, pr_number)
+            logger.info('Created pull request. See %s.', pr_url)
 
-        if args.at_mention_committers:
-            at_mention_recent_committers(base_url, api_url, repo, pr_number, args.fork_owner, args.github_token)
+            if args.at_mention_committers:
+                at_mention_recent_committers(base_url, api_url, repo, pr_number, args.fork_owner, args.github_token)
 
 
 def remove_dir(dir_name):
@@ -243,7 +260,7 @@ def file_path_from_html_url(github_master_file_url):
         return m.group(1)
 
 
-def branch_add_commit_push(file_path, git_branch_name, commit_msg, base_path=None):
+def branch_add_commit_push(file_path, git_branch_name, commit_msg, base_path, dry_run):
     """
     Git commit a file. cd to base_path if not None.
     :param file_path:
@@ -252,13 +269,22 @@ def branch_add_commit_push(file_path, git_branch_name, commit_msg, base_path=Non
     :param base_path:
     :return:
     """
-    if base_path is not None:
-        with in_dir(base_path):
-            run_cmd(['git', 'checkout', '-b', git_branch_name], stderr=subprocess.STDOUT)
-            run_cmd(['git', 'add', file_path], stderr=subprocess.STDOUT)
-            run_cmd(['git', 'commit', '-m', commit_msg], stderr=subprocess.STDOUT)
-            run_cmd(['git', 'push', '-f', '--set-upstream', 'origin', git_branch_name],
-                    stderr=subprocess.STDOUT)
+    safe_commands = [
+        ['git', 'checkout', '-b', git_branch_name],
+        ['git', 'add', file_path],
+        ['git', 'commit', '-m', commit_msg],
+    ]
+
+    with in_dir(base_path):
+        for cmd in safe_commands:
+            run_cmd(cmd, stderr=subprocess.STDOUT)
+
+        push_cmd = ['git', 'push', '-f', '--set-upstream', 'origin', git_branch_name]
+
+        if dry_run:
+            logger.info('Would push changes with %s', ' '.join(push_cmd))
+        else:
+            run_cmd(push_cmd, stderr=subprocess.STDOUT)
     return True
 
 
@@ -621,7 +647,7 @@ def clone_repo(ssh_uri, owner, repo, clone_dir, retry=False):
     return repo_clone_path
 
 
-def at_mention_recent_committers(base_url, api_url, repo, pr_number, commenting_user, github_token):
+def at_mention_recent_committers(base_url, api_url, repo, pr_number, commenting_user, github_token, dry_run):
     """
     @Mention recent committers
     :param base_url:
@@ -639,7 +665,9 @@ def at_mention_recent_committers(base_url, api_url, repo, pr_number, commenting_
 
     recent_committers = get_recent_committers(api_url, repo)
     comment = ' '.join(['@' + rc for rc in recent_committers])
-    if not comment_on_issue(api_url, repo, pr_number, comment, github_token):
+    if dry_run:
+        logger.info('Would @mention committers "%s" on %s PR %s', comment, repo, pr_number)
+    elif not comment_on_issue(api_url, repo, pr_number, comment, github_token):
         pr_url = '%s%s/pulls/%d' % (base_url, repo, pr_number)
         logger.error('Failed to @mention committers "%s" on PR %s', comment, pr_url)
     else:
@@ -701,7 +729,7 @@ def list_repos(api_url, token):
     return repo_names
 
 
-def remind_prs(base_url, api_url, pr_branch, username, token):
+def remind_prs(base_url, api_url, pr_branch, username, token, dry_run):
     """
     For all this user's open PRs, comment on them with @ mentions as a reminder
     :param base_url:
@@ -719,7 +747,7 @@ def remind_prs(base_url, api_url, pr_branch, username, token):
         if not isinstance(pull_reqs, list) or len(pull_reqs) < 1:
             continue
         at_mention_recent_committers(base_url, api_url, fork_owner + '/' + repo, pull_reqs[0]['number'],
-                                     username, token)
+                                     username, token, dry_run)
 
 
 def get_fork_owner(api_url, fork_owner, repo, token):
