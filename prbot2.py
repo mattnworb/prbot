@@ -45,7 +45,7 @@ DEFAULT_API_URL = 'https://api.github.com/'
 DEFAULT_SSH_URI = ssh_uri_from_domain(DEFAULT_DOMAIN)
 RESULTS_PER_PAGE = 100
 CLONE_DIR = 'repos'
-LOG_FORMAT = '%(asctime)s %(levelname)s: %(message)s'
+LOG_FORMAT = '%(asctime)s %(levelname)s %(name)s: %(message)s'
 DEFAULT_PUSHED_DATE = (date.today() + relativedelta(months=-1)).strftime('%Y-%m-%d')
 MAX_CMD_RETRIES = 10
 CLONE_RETRY_INTERVAL_SEC = 10
@@ -53,10 +53,17 @@ REMINDER_INTERVAL_SECONDS = 7 * 24 * 60 * 60
 MAX_GITHUB_RESULTS_PAGE = 10  # Only the first 1000 search results are available
 
 logger = logging.getLogger(__name__)
-log_handler = logging.StreamHandler()
-log_handler.setFormatter(logging.Formatter(LOG_FORMAT))
-logger.addHandler(log_handler)
-logger.setLevel(logging.INFO)
+
+def setup_logging(level=logging.INFO):
+    log_handler = logging.StreamHandler()
+    log_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+
+    logger.addHandler(log_handler)
+    logger.setLevel(level)
+
+    requestslogger = logging.getLogger('requests')
+    requestslogger.addHandler(log_handler)
+    requestslogger.setLevel(level)
 
 
 def main():
@@ -89,7 +96,9 @@ def main():
     args = parser.parse_args()
 
     if args.verbosity > 0:
-        logger.setLevel(logging.DEBUG)
+        setup_logging(logging.DEBUG)
+    else:
+        setup_logging()
 
     # if args.domain is not None:
     base_url = base_url_from_domain(args.domain) if args.domain is not None else DEFAULT_BASE_URL
